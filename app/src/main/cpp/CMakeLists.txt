@@ -7,7 +7,13 @@ project(OboePassthrough)
 add_subdirectory(oboe)
 
 # Build your native library
-add_library(native-lib SHARED native-lib.cpp)
+add_library(
+        native-lib
+        SHARED
+        native-lib.cpp
+        kiss_fft.c
+        kiss_fftr.c
+)
 
 # Include Oboe headers
 target_include_directories(native-lib PRIVATE oboe/include)
