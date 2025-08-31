@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.10.2)
 
-# Give the project a name
 project(OboePassthrough)
 
 # Pull in the Oboe build
@@ -15,7 +14,6 @@ add_library(
         kiss_fftr.c
 )
 
-# Include Oboe headers
 target_include_directories(native-lib PRIVATE oboe/include)
 
 # Link against Oboe and Android log

@@ -25,6 +25,8 @@ public:
         mFftCfg = kiss_fftr_alloc(mBufferSize, 0, nullptr, nullptr);
         mIfftCfg = kiss_fftr_alloc(mBufferSize, 1, nullptr, nullptr);
         mConversionBuffer.resize(mBufferSize);
+
+        mOverlapBuffer.resize(mBufferSize / 2, 0.0f);
     }
 
     ~MicPassthrough() {
@@ -95,7 +97,7 @@ public:
             float freq = static_cast<float>(i * mSampleRate) / mBufferSize;
             float gain = 1.0f;
             if (freq > 2500.0f && freq < 6000.0f) {
-                gain = 10.0f;
+                gain = 1.0f;
             }
             mFftOutput[i].r *= gain;
             mFftOutput[i].i *= gain;
@@ -103,9 +105,22 @@ public:
 
         kiss_fftri(mIfftCfg, mFftOutput.data(), mConversionBuffer.data());
 
-        for (int i = 0; i < numFrames; ++i) {
-            mConversionBuffer[i] /= numFrames;
-        }
+//        for (int i = 0; i < numFrames; ++i) {
+//            mConversionBuffer[i] /= numFrames;
+//        }
+
+//        // --- CHANGED: Overlap-Add Implementation ---
+//        int halfBufferSize = mBufferSize / 2;
+//
+//        // 1. Add the stored overlap from the *previous* frame to the
+//        //    *first half* of the *current* frame. This is the key step.
+//        for (int i = 0; i < halfBufferSize; ++i) {
+//            mConversionBuffer[i] += mOverlapBuffer[i];
+//        }
+//
+//        // 2. Store the *second half* of the *current* frame in the overlap
+//        //    buffer for use in the *next* frame.
+//        std::copy(mConversionBuffer.begin() + halfBufferSize, mConversionBuffer.end(), mOverlapBuffer.begin());
 
         if (mOutputStream) {
             // --- ADDED: Diagnostic Logging ---
@@ -132,6 +147,7 @@ private:
     std::vector<float> mWindowedInput;
     std::vector<kiss_fft_cpx> mFftOutput;
     std::vector<float> mConversionBuffer;
+    std::vector<float> mOverlapBuffer;
     kiss_fftr_cfg mFftCfg;
     kiss_fftr_cfg mIfftCfg;
 };
