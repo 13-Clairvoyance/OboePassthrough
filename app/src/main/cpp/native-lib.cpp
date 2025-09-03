@@ -18,7 +18,7 @@ public:
             mSampleRate(sampleRate) {
         mWindow.resize(mBufferSize);
         for (int i = 0; i < mBufferSize; ++i) {
-            mWindow[i] = 0.54f - 0.46f * cosf(2.0f * M_PI * static_cast<float>(i) / (mBufferSize - 1));
+            mWindow[i] = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (mBufferSize - 1));
         }
         mWindowedInput.resize(mBufferSize);
         mFftOutput.resize(mBufferSize / 2 + 1);
@@ -38,33 +38,58 @@ public:
     void start() {
         stop();
 
-        oboe::AudioStreamBuilder builder;
-        builder.setDirection(oboe::Direction::Input)
+        mInputRingBuffer.resize(mBufferSize * 2, 0.0f);
+        mRingWriteIndex = mRingReadIndex = mRingSize = 0;
+        mOutputFIFO.clear();
+        mOutputFIFO.reserve(mBufferSize * 8);  // avoid reallocation
+        mInputReadBuffer.resize(std::max<int32_t>(mFramesPerBurst, 256));
+
+        oboe::AudioStreamBuilder inBuilder;
+        inBuilder.setDirection(oboe::Direction::Input)
+                ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+                ->setSharingMode(oboe::SharingMode::Exclusive)
+                ->setFormat(oboe::AudioFormat::Float)
+                ->setChannelCount(oboe::ChannelCount::Mono)
+                ->setSampleRate(mSampleRate) // device chooses sample rate
+                ->setCallback(nullptr);
+
+        oboe::Result r = inBuilder.openStream(mInputStream);
+        if (r != oboe::Result::OK) {
+            LOGI("Failed to open input: %s", oboe::convertToText(r));
+            return;
+        }
+
+        // Align our internal rate to the real device rate
+        mSampleRate = mInputStream->getSampleRate();
+        mFramesPerBurst = mInputStream->getFramesPerBurst();
+
+        // 2) Open OUTPUT stream (with callback = this)
+        oboe::AudioStreamBuilder outBuilder;
+        outBuilder.setDirection(oboe::Direction::Output)
                 ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
                 ->setSharingMode(oboe::SharingMode::Exclusive)
                 ->setFormat(oboe::AudioFormat::Float)
                 ->setChannelCount(oboe::ChannelCount::Mono)
                 ->setSampleRate(mSampleRate)
+                ->setFramesPerDataCallback(mFramesPerBurst) // helps alignment
                 ->setCallback(this);
 
-        oboe::Result result = builder.openStream(mInputStream);
-        if (result != oboe::Result::OK) {
-            LOGI("Failed to open input stream. Error: %s", oboe::convertToText(result));
+        r = outBuilder.openStream(mOutputStream);
+        if (r != oboe::Result::OK) {
+            LOGI("Failed to open output: %s", oboe::convertToText(r));
             return;
         }
 
-        builder.setDirection(oboe::Direction::Output)
-                ->setCallback(nullptr);
-
-        result = builder.openStream(mOutputStream);
-        if (result != oboe::Result::OK) {
-            LOGI("Failed to open output stream. Error: %s", oboe::convertToText(result));
-            return;
-        }
-
+        // 3) Start streams: input first, then output
         mInputStream->requestStart();
         mOutputStream->requestStart();
-        LOGI("Passthrough started");
+
+        // 4) Prep helper buffers
+        mInputReadBuffer.resize(std::max<int32_t>(mFramesPerBurst, 256));
+        mOutputFIFO.clear();
+
+        LOGI("Duplex (two-stream) passthrough started at %d Hz, burst=%d",
+             mSampleRate, mFramesPerBurst);
     }
 
     void stop() {
@@ -82,67 +107,109 @@ public:
     }
 
     oboe::DataCallbackResult onAudioReady(
-            oboe::AudioStream *oboeStream,
-            void *audioData,
-            int32_t numFrames) override {
-        auto* inputFloats = static_cast<float*>(audioData);
+            oboe::AudioStream *stream, void *audioData, int32_t numFrames) override {
 
-        for (int i = 0; i < numFrames; ++i) {
-            mWindowedInput[i] = inputFloats[i] * mWindow[i];
+        float *out = static_cast<float*>(audioData);
+
+        // 1) Read mic (non-blocking)
+        if (mInputReadBuffer.size() < (size_t)numFrames) {
+            mInputReadBuffer.resize(numFrames);
         }
-
-        kiss_fftr(mFftCfg, mWindowedInput.data(), mFftOutput.data());
-
-        for (int i = 0; i < mFftOutput.size(); ++i) {
-            float freq = static_cast<float>(i * mSampleRate) / mBufferSize;
-            float gain = 1.0f;
-            if (freq > 2500.0f && freq < 6000.0f) {
-                gain = 1.0f;
-            }
-            mFftOutput[i].r *= gain;
-            mFftOutput[i].i *= gain;
-        }
-
-        kiss_fftri(mIfftCfg, mFftOutput.data(), mConversionBuffer.data());
-
-//        for (int i = 0; i < numFrames; ++i) {
-//            mConversionBuffer[i] /= numFrames;
-//        }
-
-//        // --- CHANGED: Overlap-Add Implementation ---
-//        int halfBufferSize = mBufferSize / 2;
-//
-//        // 1. Add the stored overlap from the *previous* frame to the
-//        //    *first half* of the *current* frame. This is the key step.
-//        for (int i = 0; i < halfBufferSize; ++i) {
-//            mConversionBuffer[i] += mOverlapBuffer[i];
-//        }
-//
-//        // 2. Store the *second half* of the *current* frame in the overlap
-//        //    buffer for use in the *next* frame.
-//        std::copy(mConversionBuffer.begin() + halfBufferSize, mConversionBuffer.end(), mOverlapBuffer.begin());
-
-        if (mOutputStream) {
-            // --- ADDED: Diagnostic Logging ---
-            // 1. Log the first sample of the buffer we are about to play.
-            // This tells us if the audio is silent (all zeros).
-            LOGI("Output buffer sample[0]: %f", mConversionBuffer[0]);
-
-            // 2. Write to the output stream and log the result.
-            // This tells us if the write operation itself is failing.
-            auto result = mOutputStream->write(mConversionBuffer.data(), numFrames, 0);
-            if (!result) {
-                LOGI("Error writing to output stream: %s", oboe::convertToText(result.error()));
+        int32_t framesRead = 0;
+        if (mInputStream) {
+            auto res = mInputStream->read(mInputReadBuffer.data(), numFrames, 0);
+            if (res) {
+                framesRead = res.value();
+            } else {
+                framesRead = 0;
+                // avoid logging every callback
             }
         }
+
+        // 2) Write mic samples into ring buffer (real-time safe, O(1) per sample)
+        for (int i = 0; i < framesRead; ++i) {
+            mInputRingBuffer[mRingWriteIndex] = mInputReadBuffer[i];
+            mRingWriteIndex = (mRingWriteIndex + 1) % mInputRingBuffer.size();
+
+            if (mRingSize < (int)mInputRingBuffer.size()) {
+                ++mRingSize;
+            } else {
+                // Overrun: advance read pointer to avoid overwriting unread data
+                mRingReadIndex = (mRingReadIndex + 1) % mInputRingBuffer.size();
+            }
+        }
+
+        // 3) Process full blocks while available (50% overlap)
+        const int hop = mBufferSize / 2;
+        while (mRingSize >= mBufferSize) {
+            // copy block from ring to window buffer
+            for (int n = 0; n < mBufferSize; ++n) {
+                int idx = (mRingReadIndex + n) % mInputRingBuffer.size();
+                mWindowedInput[n] = mInputRingBuffer[idx] * mWindow[n]; // window here
+            }
+
+            // FFT
+            kiss_fftr(mFftCfg, mWindowedInput.data(), mFftOutput.data());
+
+            // Filter (keep 125-18000 Hz)
+            for (int k = 0; k < static_cast<int>(mFftOutput.size()); ++k) {
+                float freq = (static_cast<float>(k) * mSampleRate) / mBufferSize;
+                float gain = (freq < 125.0f || freq > 18000.0f) ? 0.0f : 1.0f;
+                mFftOutput[k].r *= gain;
+                mFftOutput[k].i *= gain;
+            }
+
+            // IFFT
+            kiss_fftri(mIfftCfg, mFftOutput.data(), mConversionBuffer.data());
+
+            // Normalize
+            for (int i = 0; i < mBufferSize; ++i) {
+                mConversionBuffer[i] /= mBufferSize;
+            }
+
+            // Overlap-add (50% hop)
+            int half = hop;
+            for (int i = 0; i < half; ++i) {
+                mConversionBuffer[i] += mOverlapBuffer[i];
+            }
+
+            // push first half to output FIFO
+            mOutputFIFO.insert(mOutputFIFO.end(),
+                               mConversionBuffer.begin(),
+                               mConversionBuffer.begin() + half);
+
+            // save second half to overlap buffer
+            std::copy(mConversionBuffer.begin() + half,
+                      mConversionBuffer.end(),
+                      mOverlapBuffer.begin());
+
+            // advance read index & reduce available size by hop
+            mRingReadIndex = (mRingReadIndex + hop) % mInputRingBuffer.size();
+            mRingSize -= hop;
+        }
+
+        // 4) Deliver to output (from FIFO). If insufficient, zero-fill
+        int available = static_cast<int>(mOutputFIFO.size());
+        int toCopy = std::min(available, numFrames);
+        if (toCopy > 0) {
+            std::copy(mOutputFIFO.begin(), mOutputFIFO.begin() + toCopy, out);
+            // remove copied samples (this is O(n) per erase; for production replace FIFO with ring)
+            mOutputFIFO.erase(mOutputFIFO.begin(), mOutputFIFO.begin() + toCopy);
+        }
+        if (toCopy < numFrames) {
+            std::fill(out + toCopy, out + numFrames, 0.0f);
+        }
+
         return oboe::DataCallbackResult::Continue;
     }
+
+
 
 private:
     std::shared_ptr<oboe::AudioStream> mInputStream;
     std::shared_ptr<oboe::AudioStream> mOutputStream;
     const int32_t mBufferSize;
-    const int32_t mSampleRate;
+    int mSampleRate;
     std::vector<float> mWindow;
     std::vector<float> mWindowedInput;
     std::vector<kiss_fft_cpx> mFftOutput;
@@ -150,6 +217,16 @@ private:
     std::vector<float> mOverlapBuffer;
     kiss_fftr_cfg mFftCfg;
     kiss_fftr_cfg mIfftCfg;
+    std::vector<float> mInputReadBuffer;   // temp mic reads per callback
+    std::vector<float> mOutputFIFO;
+    int32_t mFramesPerBurst = 0;
+    int mAccumWriteIndex;
+    int32_t mAccumSize;
+    std::vector<float> mInputRingBuffer;
+    int mRingWriteIndex = 0;
+    int mRingReadIndex = 0;
+    int mRingSize = 0;
+
 };
 
 std::unique_ptr<MicPassthrough> passthroughEngine = nullptr;
